@@ -3,7 +3,7 @@
   "configurations": [
     {
       "name": "cibc-ynab-sync",
-      "runtimeExecutable": "pnpm",
+      "runtimeExecutable": "npm",
       "runtimeArgs": ["run", "dev"],
       "port": 3000
     }
