@@ -29,7 +29,7 @@ npm install
 npm run build
 ```
 
-`next.config.ts` sets `output: "standalone"`, so the build also produces a self-contained server at `.next/standalone/server.js` with a pruned `node_modules`, useful for a bare VPS deploy. Static assets aren't copied there automatically:
+`next.config.mjs` sets `output: "standalone"`, so the build also produces a self-contained server at `.next/standalone/server.js` with a pruned `node_modules`, useful for a bare VPS deploy. Static assets aren't copied there automatically:
 
 ```sh
 cp -r public .next/standalone/public
@@ -92,6 +92,6 @@ Point it at this repo with:
 ## Scripts
 
 - `npm run dev` — start the dev server
-- `npm run build` — production build (standalone output)
+- `npm run build` — production build (standalone output). Runs `next build --webpack` rather than the Turbopack default: some hosts (e.g. Hostinger's build containers) run an older glibc that can't load Next's native Turbopack/SWC binaries, and only the webpack build path has a working WASM fallback for that case.
 - `npm start` — `next start` (useful for local smoke-testing; on a VPS prefer `node .next/standalone/server.js` per above)
 - `npm run lint` — run ESLint
