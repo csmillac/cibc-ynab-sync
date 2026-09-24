@@ -4,10 +4,11 @@ const YNAB_API = "https://api.ynab.com/v1";
 const SAFE_ID = /^[a-zA-Z0-9_-]{1,100}$/;
 
 type Body = {
-  action?: "plans" | "accounts" | "transactions";
+  action?: "plans" | "accounts" | "transactions" | "deleteTransactions";
   token?: string;
   planId?: string;
   transactions?: Array<Record<string, unknown>>;
+  transactionIds?: string[];
 };
 
 function fail(message: string, status = 400) {
@@ -50,6 +51,17 @@ export async function POST(request: NextRequest) {
       if (body.transactions.length > 500) return fail("Import a maximum of 500 transactions at a time.");
       const data = await callYnab(`/plans/${encodeURIComponent(body.planId)}/transactions`, token, { method: "POST", body: JSON.stringify({ transactions: body.transactions }) });
       return NextResponse.json({ transaction_ids: data?.transaction_ids ?? [], duplicate_import_ids: data?.duplicate_import_ids ?? [] }, { headers: { "Cache-Control": "no-store" } });
+    }
+    if (body.action === "deleteTransactions") {
+      const ids = body.transactionIds;
+      if (!Array.isArray(ids) || ids.length < 1) return fail("No transactions were provided.");
+      if (ids.length > 500) return fail("Undo a maximum of 500 transactions at a time.");
+      if (!ids.every((id) => typeof id === "string" && SAFE_ID.test(id))) return fail("One or more transaction IDs are invalid.");
+      const results = await Promise.allSettled(
+        ids.map((id) => callYnab(`/plans/${encodeURIComponent(body.planId!)}/transactions/${encodeURIComponent(id)}`, token, { method: "DELETE" })),
+      );
+      const failed = results.filter((result) => result.status === "rejected").length;
+      return NextResponse.json({ deleted: results.length - failed, failed }, { headers: { "Cache-Control": "no-store" } });
     }
     return fail("Unknown YNAB action.");
   } catch (error) {

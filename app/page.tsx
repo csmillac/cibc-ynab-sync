@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ArrowRight, Check, CheckCircle2, Eye, EyeOff, FileSpreadsheet, KeyRound, Loader2, LockKeyhole, RefreshCw, ShieldCheck, UploadCloud, X } from "lucide-react";
+import { ArrowRight, Check, CheckCircle2, Eye, EyeOff, FileSpreadsheet, KeyRound, Loader2, LockKeyhole, RefreshCw, RotateCcw, ShieldCheck, UploadCloud, X } from "lucide-react";
 import { toast } from "sonner";
 
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
@@ -20,12 +20,23 @@ type Plan = { id: string; name: string };
 type Account = { id: string; name: string; closed?: boolean; deleted?: boolean };
 type Mapping = { date: string; payee: string; amount: string; debit: string; credit: string; memo: string };
 type AmountMode = "signed" | "expenses-positive";
-type ImportFile = { id: string; csv: CsvData; fileName: string; accountId: string; mapping: Mapping; dateFormat: DateFormat; amountMode: AmountMode; selectedRows: Set<number>; result: { imported: number; duplicates: number } | null; error?: string };
+type SyncResult = { imported: number; duplicates: number; transactionIds: string[] };
+type ImportFile = { id: string; csv: CsvData; fileName: string; accountId: string; mapping: Mapping; dateFormat: DateFormat; amountMode: AmountMode; selectedRows: Set<number>; result: SyncResult | null; error?: string };
 type Prepared = { rowIndex: number; date: string; payee: string; memo: string; amount: number; importId: string; selected: boolean; valid: boolean; error?: string };
 
 const EMPTY_MAPPING: Mapping = { date: "", payee: "", amount: "", debit: "", credit: "", memo: "" };
 const normalize = (value: string) => value.toLowerCase().replace(/[^a-z0-9]/g, "");
 const matchHeader = (headers: string[], candidates: string[]) => headers.find((header) => candidates.some((candidate) => normalize(header).includes(candidate))) ?? "";
+const HTML_ENTITIES: Record<string, string> = { amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " " };
+function decodeHtmlEntities(value: string): string {
+  return value.replace(/&(#x[0-9a-f]+|#\d+|[a-z]+);/gi, (match, entity: string) => {
+    if (entity[0] === "#") {
+      const code = entity[1]?.toLowerCase() === "x" ? Number.parseInt(entity.slice(2), 16) : Number.parseInt(entity.slice(1), 10);
+      return Number.isFinite(code) ? String.fromCodePoint(code) : match;
+    }
+    return HTML_ENTITIES[entity.toLowerCase()] ?? match;
+  });
+}
 
 function detectMapping(headers: string[]): Mapping {
   return {
@@ -66,8 +77,8 @@ function prepareFile({csv, mapping, dateFormat, amountMode, selectedRows}: Impor
       }
       const amount = amountValue === null ? 0 : Math.round(amountValue * 1000);
       const payeeRaw = mapping.payee ? row[mapping.payee] ?? "" : "";
-      const payee = payeeRaw.replace(/\s+/g, " ").trim().slice(0, 200) || "CIBC Caribbean transaction";
-      const memo = mapping.memo ? (row[mapping.memo] ?? "").trim().slice(0, 500) : "Imported from CIBC Caribbean";
+      const payee = decodeHtmlEntities(payeeRaw).replace(/\s+/g, " ").trim().slice(0, 200) || "CIBC Caribbean transaction";
+      const memo = mapping.memo ? decodeHtmlEntities((row[mapping.memo] ?? "").trim()).slice(0, 500) : "Imported from CIBC Caribbean";
       const occurrenceKey = `${amount}:${date ?? "invalid"}`;
       const occurrence = (occurrences.get(occurrenceKey) ?? 0) + 1;
       if (!pending) occurrences.set(occurrenceKey, occurrence);
@@ -92,6 +103,7 @@ export default function Home() {
   const [files, setFiles] = useState<ImportFile[]>([]);
   const [activeId, setActiveId] = useState("");
   const [syncing, setSyncing] = useState(false);
+  const [undoingId, setUndoingId] = useState<string | null>(null);
   const activeFile = files.find(file => file.id === activeId) ?? files[0];
   const csv = activeFile?.csv ?? null;
   const fileName = activeFile?.fileName ?? "";
@@ -199,22 +211,41 @@ export default function Home() {
     setSyncing(true);
     let failed = false;
     for (const file of files) {
-      let imported = 0; let duplicates = 0;
+      let imported = 0; let duplicates = 0; const transactionIds: string[] = [];
       const rows = prepareFile(file).filter(row => row.selected && row.valid);
       try {
         for (let offset = 0; offset < rows.length; offset += 500) {
           const result = await ynabRequest<{transaction_ids: string[]; duplicate_import_ids: string[]}>({action: "transactions", token: sessionToken, planId, transactions: rows.slice(offset, offset + 500).map(row => ({account_id: file.accountId, date: row.date, amount: row.amount, payee_name: row.payee, memo: row.memo, cleared: "cleared", approved: false, import_id: row.importId}))});
-          imported += result.transaction_ids.length; duplicates += result.duplicate_import_ids.length;
+          imported += result.transaction_ids.length; duplicates += result.duplicate_import_ids.length; transactionIds.push(...result.transaction_ids);
         }
-        setFiles(current => current.map(item => item.id === file.id ? {...item, result: {imported, duplicates}, error: undefined} : item));
+        setFiles(current => current.map(item => item.id === file.id ? {...item, result: {imported, duplicates, transactionIds}, error: undefined} : item));
       } catch (error) {
         failed = true;
-        setFiles(current => current.map(item => item.id === file.id ? {...item, result: {imported, duplicates}, error: `${error instanceof Error ? error.message : "Sync failed"} Retry checks import IDs to avoid repeats.`} : item));
+        setFiles(current => current.map(item => item.id === file.id ? {...item, result: {imported, duplicates, transactionIds}, error: `${error instanceof Error ? error.message : "Sync failed"} Retry checks import IDs to avoid repeats.`} : item));
       }
     }
     setSyncing(false);
     if (failed) toast.error("Some files could not finish. Review the results and retry.");
     else toast.success("Batch sync complete");
+  };
+
+  const undoSync = async (file: ImportFile) => {
+    const transactionIds = file.result?.transactionIds ?? [];
+    if (!transactionIds.length || !sessionToken || !planId || undoingId || syncing) return;
+    setUndoingId(file.id);
+    try {
+      let removed = 0;
+      for (let offset = 0; offset < transactionIds.length; offset += 500) {
+        const result = await ynabRequest<{ deleted: number; failed: number }>({ action: "deleteTransactions", token: sessionToken, planId, transactionIds: transactionIds.slice(offset, offset + 500) });
+        removed += result.deleted;
+      }
+      setFiles(current => current.map(item => item.id === file.id ? { ...item, result: null, error: undefined } : item));
+      toast.success(`${removed} transaction${removed === 1 ? "" : "s"} removed from YNAB`);
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "Could not undo the sync. Some transactions may remain in YNAB.");
+    } finally {
+      setUndoingId(null);
+    }
   };
 
   useEffect(() => {
@@ -233,7 +264,7 @@ export default function Home() {
 
   return (
     <main className="min-h-screen bg-background text-foreground">
-      <fieldset disabled={syncing} className="min-w-0 border-0 p-0 m-0">
+      <fieldset disabled={syncing || Boolean(undoingId)} className="min-w-0 border-0 p-0 m-0">
       <Toaster richColors position="top-center" />
       <header className="border-b border-white/10 bg-[#071a2b] text-white">
         <div className="mx-auto flex max-w-[1440px] items-center justify-between px-5 py-4 sm:px-8">
@@ -282,7 +313,7 @@ export default function Home() {
             {files.map(file => <div key={file.id} className={`rounded-xl border p-4 grid gap-3 sm:grid-cols-[minmax(0,1fr)_minmax(180px,1fr)_auto] ${file.id === activeFile?.id ? "border-primary bg-muted/40" : ""}`}>
               <div className="min-w-0"><p className="font-semibold break-all">{file.fileName}</p><p className="text-sm text-muted-foreground">{prepareFile(file).filter(row => row.valid && row.selected).length} selected · {file.csv.rows.length} rows</p>{file.result && <p className="text-sm">{file.result.imported} imported · {file.result.duplicates} duplicates skipped</p>}{file.error && <p className="text-sm text-destructive" role="alert">{file.error}</p>}</div>
               <SelectField label="Destination account" value={file.accountId} onChange={value => setFiles(current => current.map(item => item.id === file.id ? {...item, accountId: value, result: null, error: undefined} : item))} disabled={!planId || loadingAccounts || syncing} placeholder="Assign an account" items={accounts} />
-              <div className="flex gap-2 items-center"><Button variant="outline" onClick={() => setActiveId(file.id)}>Review</Button><Button variant="ghost" aria-label={`Remove ${file.fileName}`} onClick={() => setFiles(current => current.filter(item => item.id !== file.id))}><X /></Button></div>
+              <div className="flex gap-2 items-center">{file.result && file.result.transactionIds.length > 0 && <Button variant="outline" onClick={() => undoSync(file)} disabled={undoingId === file.id}>{undoingId === file.id ? <Loader2 className="animate-spin" /> : <RotateCcw />}{undoingId === file.id ? "Undoing…" : "Undo"}</Button>}<Button variant="outline" onClick={() => setActiveId(file.id)}>Review</Button><Button variant="ghost" aria-label={`Remove ${file.fileName}`} onClick={() => setFiles(current => current.filter(item => item.id !== file.id))}><X /></Button></div>
             </div>)}
             <Button onClick={sync} disabled={!batchReady || syncing}>{syncing ? "Syncing files…" : `Sync all ${files.length} files to YNAB`}</Button>
             {!batchReady && <p className="text-sm text-muted-foreground">Each file needs an account, valid mapping, and at least one valid selected transaction. Remove files you do not want to import.</p>}
@@ -308,7 +339,7 @@ export default function Home() {
               {invalidCount > 0 && <Alert variant="destructive" className="m-5 mb-0 sm:mx-6"><X /><AlertTitle>{invalidCount} row{invalidCount === 1 ? "" : "s"} need attention</AlertTitle><AlertDescription>Check the date format and amount mapping. Pending transactions are excluded until posted. Invalid rows will not be synced.</AlertDescription></Alert>}
               <div className="max-h-[520px] overflow-auto"><Table><TableHeader className="sticky top-0 z-10 bg-card"><TableRow><TableHead className="w-12"><Checkbox checked={allSelected} onCheckedChange={(value) => toggleAll(Boolean(value))} aria-label="Select all transactions" /></TableHead><TableHead>Date</TableHead><TableHead>Payee</TableHead><TableHead>Status</TableHead><TableHead className="text-right">Amount</TableHead></TableRow></TableHeader><TableBody>{prepared.map((row) => <TableRow key={row.rowIndex} className={!row.valid ? "bg-destructive/5" : ""}><TableCell><Checkbox checked={row.selected} onCheckedChange={(value) => toggleRow(row.rowIndex, Boolean(value))} aria-label={`Select row ${row.rowIndex + 1}`} /></TableCell><TableCell className="whitespace-nowrap font-medium">{row.date}</TableCell><TableCell><div className="max-w-[360px] truncate">{row.payee}</div>{row.memo && <div className="max-w-[360px] truncate text-xs text-muted-foreground">{row.memo}</div>}</TableCell><TableCell>{row.valid ? <Badge variant="outline" className="border-[#b8d8cc] text-[#087a55]">Ready</Badge> : <span className="text-sm font-medium text-destructive">{row.error}</span>}</TableCell><TableCell className={`whitespace-nowrap text-right font-semibold tabular-nums ${row.amount > 0 ? "text-[#087a55]" : ""}`}>{formatCurrency(row.amount)}</TableCell></TableRow>)}</TableBody></Table></div>
               <div className="border-t border-border bg-[#fafcfd] p-5 sm:p-6">
-                {syncResult && <div className="mb-4 flex items-start gap-3 rounded-xl border border-[#b8d8cc] bg-[#edf9f4] p-4 text-[#164e3d]"><CheckCircle2 className="mt-0.5 h-5 w-5 shrink-0" /><div><p className="font-semibold">Sync complete</p><p className="text-sm text-[#35695a]">{syncResult.imported} added to YNAB{syncResult.duplicates ? ` · ${syncResult.duplicates} duplicate${syncResult.duplicates === 1 ? "" : "s"} safely skipped` : ""}.</p></div></div>}
+                {syncResult && <div className="mb-4 flex flex-col gap-3 rounded-xl border border-[#b8d8cc] bg-[#edf9f4] p-4 text-[#164e3d] sm:flex-row sm:items-start sm:justify-between"><div className="flex items-start gap-3"><CheckCircle2 className="mt-0.5 h-5 w-5 shrink-0" /><div><p className="font-semibold">Sync complete</p><p className="text-sm text-[#35695a]">{syncResult.imported} added to YNAB{syncResult.duplicates ? ` · ${syncResult.duplicates} duplicate${syncResult.duplicates === 1 ? "" : "s"} safely skipped` : ""}.</p>{syncResult.transactionIds.length > 0 && <p className="text-xs text-[#35695a]">You can undo this until you leave or reload the page.</p>}</div></div>{syncResult.transactionIds.length > 0 && activeFile && <Button variant="outline" size="sm" className="shrink-0" onClick={() => undoSync(activeFile)} disabled={undoingId === activeFile.id}>{undoingId === activeFile.id ? <Loader2 className="animate-spin" /> : <RotateCcw />}{undoingId === activeFile.id ? "Undoing…" : "Undo sync"}</Button>}</div>}
                 <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between"><div className="flex items-center gap-2 text-sm text-muted-foreground"><ShieldCheck className="h-4 w-4 text-[#087a55]" /> Duplicate-safe import IDs are added automatically</div><Button size="lg" className="h-12 min-w-56" onClick={sync} disabled={syncing || !batchReady}>{syncing ? <Loader2 className="animate-spin" /> : <ArrowRight />}{syncing ? "Syncing…" : `Sync all ${files.length} files to YNAB`}</Button></div>
                 {syncing && <Progress className="mt-4" value={70} />}
               </div>
