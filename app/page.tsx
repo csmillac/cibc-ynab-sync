@@ -15,9 +15,8 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Toaster } from "@/components/ui/sonner";
 import { parseCsv, parseDate, parseMoney, type CsvData, type DateFormat } from "@/lib/csv";
+import { fetchPlans, fetchAccounts, postTransactions, deleteTransactions, type Plan, type Account } from "@/lib/ynab";
 
-type Plan = { id: string; name: string };
-type Account = { id: string; name: string; closed?: boolean; deleted?: boolean };
 type Mapping = { date: string; payee: string; amount: string; debit: string; credit: string; memo: string };
 type AmountMode = "signed" | "expenses-positive";
 type SyncResult = { imported: number; duplicates: number; transactionIds: string[] };
@@ -51,13 +50,6 @@ function detectMapping(headers: string[]): Mapping {
 
 function formatCurrency(milliunits: number) {
   return new Intl.NumberFormat("en-BB", { style: "currency", currency: "BBD" }).format(milliunits / 1000);
-}
-
-async function ynabRequest<T>(payload: Record<string, unknown>): Promise<T> {
-  const response = await fetch("/api/ynab", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
-  const result = await response.json().catch(() => ({ error: "YNAB returned an unreadable response." })) as T & { error?: string };
-  if (!response.ok) throw new Error(result.error || "The YNAB request failed.");
-  return result as T;
 }
 
 function prepareFile({csv, mapping, dateFormat, amountMode, selectedRows}: ImportFile): Prepared[] {
@@ -148,12 +140,12 @@ export default function Home() {
     setConnecting(true);
     setSyncResult(null);
     try {
-      const result = await ynabRequest<{ plans: Plan[] }>({ action: "plans", token: token.trim() });
+      const plans = await fetchPlans(token);
       if (version !== connectionVersion.current) return;
-      if (!result.plans?.length) throw new Error("No YNAB plans were found for this token.");
-      setPlans(result.plans);
+      if (!plans.length) throw new Error("No YNAB plans were found for this token.");
+      setPlans(plans);
       setSessionToken(token.trim());
-      setPlanId(result.plans[0].id);
+      setPlanId(plans[0].id);
       try {
         localStorage.setItem("cibc-ynab-token", token.trim());
         setSavedToken(true);
@@ -171,10 +163,10 @@ export default function Home() {
     let cancelled = false;
     setLoadingAccounts(true); setAccounts([]);
     setFiles(current => current.map(file => ({...file, accountId: "", result: null, error: undefined})));
-    ynabRequest<{ accounts: Account[] }>({ action: "accounts", token: sessionToken, planId })
-      .then((result) => {
+    fetchAccounts(sessionToken, planId)
+      .then((accounts) => {
         if (cancelled) return;
-        const active = (result.accounts ?? []).filter((account) => !account.closed && !account.deleted);
+        const active = accounts.filter((account) => !account.closed && !account.deleted);
         setAccounts(active);
       })
       .catch((error) => !cancelled && toast.error(error instanceof Error ? error.message : "Could not load accounts."))
@@ -215,7 +207,7 @@ export default function Home() {
       const rows = prepareFile(file).filter(row => row.selected && row.valid);
       try {
         for (let offset = 0; offset < rows.length; offset += 500) {
-          const result = await ynabRequest<{transaction_ids: string[]; duplicate_import_ids: string[]}>({action: "transactions", token: sessionToken, planId, transactions: rows.slice(offset, offset + 500).map(row => ({account_id: file.accountId, date: row.date, amount: row.amount, payee_name: row.payee, memo: row.memo, cleared: "cleared", approved: false, import_id: row.importId}))});
+          const result = await postTransactions(sessionToken, planId, rows.slice(offset, offset + 500).map(row => ({account_id: file.accountId, date: row.date, amount: row.amount, payee_name: row.payee, memo: row.memo, cleared: "cleared", approved: false, import_id: row.importId})));
           imported += result.transaction_ids.length; duplicates += result.duplicate_import_ids.length; transactionIds.push(...result.transaction_ids);
         }
         setFiles(current => current.map(item => item.id === file.id ? {...item, result: {imported, duplicates, transactionIds}, error: undefined} : item));
@@ -236,7 +228,7 @@ export default function Home() {
     try {
       let removed = 0;
       for (let offset = 0; offset < transactionIds.length; offset += 500) {
-        const result = await ynabRequest<{ deleted: number; failed: number }>({ action: "deleteTransactions", token: sessionToken, planId, transactionIds: transactionIds.slice(offset, offset + 500) });
+        const result = await deleteTransactions(sessionToken, planId, transactionIds.slice(offset, offset + 500));
         removed += result.deleted;
       }
       setFiles(current => current.map(item => item.id === file.id ? { ...item, result: null, error: undefined } : item));
