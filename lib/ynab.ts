@@ -1,12 +1,14 @@
 const YNAB_API = "https://api.ynab.com/v1";
 
 export type Plan = { id: string; name: string };
-export type Account = { id: string; name: string; closed?: boolean; deleted?: boolean };
+export type Account = { id: string; name: string; closed?: boolean; deleted?: boolean; transfer_payee_id?: string | null; balance?: number; cleared_balance?: number };
+export type ExistingTransaction = { id: string; account_id: string; date: string; amount: number; payee_name?: string | null; import_id?: string | null; deleted?: boolean };
 
 type YnabData = {
   plans?: unknown[];
   budgets?: unknown[];
   accounts?: unknown[];
+  transactions?: unknown[];
   transaction_ids?: string[];
   duplicate_import_ids?: string[];
 };
@@ -40,6 +42,12 @@ export async function fetchPlans(token: string): Promise<Plan[]> {
 export async function fetchAccounts(token: string, planId: string): Promise<Account[]> {
   const data = await callYnab(`/plans/${encodeURIComponent(planId)}/accounts`, requireToken(token));
   return (data?.accounts ?? []) as Account[];
+}
+
+export async function fetchTransactions(token: string, planId: string, sinceDate: string): Promise<ExistingTransaction[]> {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(sinceDate)) throw new Error("A valid start date is required.");
+  const data = await callYnab(`/plans/${encodeURIComponent(planId)}/transactions?since_date=${sinceDate}`, requireToken(token));
+  return ((data?.transactions ?? []) as ExistingTransaction[]).filter((transaction) => !transaction.deleted);
 }
 
 export async function postTransactions(token: string, planId: string, transactions: Array<Record<string, unknown>>): Promise<{ transaction_ids: string[]; duplicate_import_ids: string[] }> {

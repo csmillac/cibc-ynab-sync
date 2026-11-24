@@ -15,13 +15,14 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Toaster } from "@/components/ui/sonner";
 import { parseCsv, parseDate, parseMoney, type CsvData, type DateFormat } from "@/lib/csv";
-import { fetchPlans, fetchAccounts, postTransactions, deleteTransactions, type Plan, type Account } from "@/lib/ynab";
+import { fetchPlans, fetchAccounts, fetchTransactions, postTransactions, deleteTransactions, type Plan, type Account, type ExistingTransaction } from "@/lib/ynab";
+import { planBatch, transferAccountNumber, type RowPlan } from "@/lib/plan";
 
 type Mapping = { date: string; payee: string; amount: string; debit: string; credit: string; memo: string };
 type AmountMode = "signed" | "expenses-positive";
 type SyncResult = { imported: number; duplicates: number; transactionIds: string[] };
-type ImportFile = { id: string; csv: CsvData; fileName: string; accountId: string; mapping: Mapping; dateFormat: DateFormat; amountMode: AmountMode; selectedRows: Set<number>; result: SyncResult | null; error?: string };
-type Prepared = { rowIndex: number; date: string; payee: string; memo: string; amount: number; importId: string; selected: boolean; valid: boolean; error?: string };
+type ImportFile = { id: string; csv: CsvData; fileName: string; accountId: string; mapping: Mapping; dateFormat: DateFormat; amountMode: AmountMode; selectedRows: Set<number>; forcedRows: Set<number>; result: SyncResult | null; error?: string };
+type Prepared = { rowIndex: number; date: string; payee: string; memo: string; amount: number; importId: string; selected: boolean; valid: boolean; error?: string; skipped: boolean; pending: boolean; note?: string; tone?: "info" | "warn"; transferAccountId?: string };
 
 const EMPTY_MAPPING: Mapping = { date: "", payee: "", amount: "", debit: "", credit: "", memo: "" };
 const normalize = (value: string) => value.toLowerCase().replace(/[^a-z0-9]/g, "");
@@ -52,6 +53,32 @@ function formatCurrency(milliunits: number) {
   return new Intl.NumberFormat("en-BB", { style: "currency", currency: "BBD" }).format(milliunits / 1000);
 }
 
+const TRANSFER_MAP_KEY = "cibc-ynab-transfer-map";
+
+// Applies the batch plan: rows flagged to skip stay unticked unless the user explicitly ticks them.
+function applyPlan(rows: Prepared[], file: ImportFile, filePlan: Map<number, RowPlan> | undefined): Prepared[] {
+  if (!filePlan?.size) return rows;
+  return rows.map((row) => {
+    const rowPlan = filePlan.get(row.rowIndex);
+    if (!rowPlan) return row;
+    return { ...row, skipped: rowPlan.skip, note: rowPlan.note, tone: rowPlan.tone, transferAccountId: rowPlan.transferAccountId, selected: row.selected && (!rowPlan.skip || file.forcedRows.has(row.rowIndex)) };
+  });
+}
+
+// The bank's running balance after the most recent transaction in the file (BBD milliunits), or null if the file has none.
+function bankBalance(file: ImportFile): number | null {
+  const header = file.csv.headers.find((name) => normalize(name) === "runningbalance");
+  if (!header || !file.mapping.date) return null;
+  const entries = file.csv.rows.map((row, index) => ({ index, date: parseDate(row[file.mapping.date] ?? "", file.dateFormat) ?? "", balance: parseMoney(row[header] ?? "") })).filter((entry): entry is { index: number; date: string; balance: number } => entry.balance !== null);
+  if (!entries.length) return null;
+  const latest = entries.reduce((best, entry) => (entry.date > best ? entry.date : best), entries[0].date);
+  const sameDay = entries.filter((entry) => entry.date === latest);
+  // Exports list newest first; when the file runs oldest first, the last row of the latest day is the closing balance.
+  const descending = entries[0].date >= entries[entries.length - 1].date;
+  const closing = descending ? sameDay[0] : sameDay[sameDay.length - 1];
+  return Math.round(closing.balance * 1000);
+}
+
 function prepareFile({csv, mapping, dateFormat, amountMode, selectedRows}: ImportFile): Prepared[] {
     if (!csv) return [];
     const occurrences = new Map<string, number>();
@@ -75,7 +102,7 @@ function prepareFile({csv, mapping, dateFormat, amountMode, selectedRows}: Impor
       const occurrence = (occurrences.get(occurrenceKey) ?? 0) + 1;
       if (!pending) occurrences.set(occurrenceKey, occurrence);
       const errors = [pending ? "Pending — excluded" : "", !date && !pending ? "Invalid date" : "", amountValue === null || amount === 0 ? "Invalid amount" : ""].filter(Boolean);
-      return { rowIndex, date: date ?? "—", payee, memo, amount, importId: date ? `YNAB:${amount}:${date}:${occurrence}` : "", selected: selectedRows.has(rowIndex), valid: errors.length === 0, error: errors.join(" · ") || undefined };
+      return { rowIndex, date: date ?? "—", payee, memo, amount, importId: date ? `YNAB:${amount}:${date}:${occurrence}` : "", selected: selectedRows.has(rowIndex), valid: errors.length === 0, error: errors.join(" · ") || undefined, skipped: false, pending };
     });
 }
 
@@ -94,6 +121,11 @@ export default function Home() {
   const [loadingAccounts, setLoadingAccounts] = useState(false);
   const [files, setFiles] = useState<ImportFile[]>([]);
   const [activeId, setActiveId] = useState("");
+  const [existing, setExisting] = useState<ExistingTransaction[]>([]);
+  const [existingStatus, setExistingStatus] = useState<"idle" | "loading" | "ready" | "failed">("idle");
+  const [existingVersion, setExistingVersion] = useState(0);
+  const [transferMap, setTransferMap] = useState<Record<string, string>>({});
+  const [refreshingAccounts, setRefreshingAccounts] = useState(false);
   const [syncing, setSyncing] = useState(false);
   const [undoingId, setUndoingId] = useState<string | null>(null);
   const activeFile = files.find(file => file.id === activeId) ?? files[0];
@@ -103,7 +135,6 @@ export default function Home() {
   const mapping = activeFile?.mapping ?? EMPTY_MAPPING;
   const dateFormat = activeFile?.dateFormat ?? "dd/mm/yyyy";
   const amountMode = activeFile?.amountMode ?? "signed";
-  const selectedRows = activeFile?.selectedRows ?? new Set<number>();
   const syncResult = activeFile?.result ?? null;
   function updateActive<K extends keyof ImportFile>(key: K, value: ImportFile[K] | ((current: ImportFile[K]) => ImportFile[K])) {
     setFiles(current => current.map(file => file.id === activeFile?.id ? { ...file, [key]: typeof value === "function" ? (value as (v: ImportFile[K]) => ImportFile[K])(file[key]) : value, ...(key !== "result" ? {result: null, error: undefined} : {}) } : file));
@@ -182,14 +213,47 @@ export default function Home() {
         if (file.size > 5_000_000) throw new Error("The limit is 5 MB per file.");
         const csv = parseCsv(await file.text());
         if (!csv.rows.length || csv.headers.length < 2) throw new Error("No transaction rows found.");
-        additions.push({id: crypto.randomUUID(), csv, fileName: file.name, accountId: "", mapping: detectMapping(csv.headers), dateFormat: "dd/mm/yyyy", amountMode: csv.headers.some(h => normalize(h) === "amountbbd") && csv.headers.some(h => normalize(h) === "cardno") ? "expenses-positive" : "signed", selectedRows: new Set(csv.rows.map((_, index) => index)), result: null});
+        additions.push({id: crypto.randomUUID(), csv, fileName: file.name, accountId: "", mapping: detectMapping(csv.headers), dateFormat: "dd/mm/yyyy", amountMode: csv.headers.some(h => normalize(h) === "amountbbd") && csv.headers.some(h => normalize(h) === "cardno") ? "expenses-positive" : "signed", selectedRows: new Set(csv.rows.map((_, index) => index)), forcedRows: new Set<number>(), result: null});
       } catch (error) { toast.error(`${file.name}: ${error instanceof Error ? error.message : "Could not read file"}`); }
     }
     setFiles(current => [...current, ...additions]);
     if (additions.length) { setActiveId(additions[0].id); toast.success(`${additions.length} CSV files added`); }
   };
 
-  const prepared = useMemo(() => activeFile ? prepareFile(activeFile) : [], [activeFile]);
+  const rawRows = useMemo(() => new Map(files.map((file) => [file.id, prepareFile(file)])), [files]);
+  const sinceDate = useMemo(() => {
+    const dates = files.flatMap((file) => (rawRows.get(file.id) ?? []).filter((row) => row.valid).map((row) => row.date)).sort();
+    if (!dates.length) return "";
+    const start = new Date(`${dates[0]}T00:00:00Z`); start.setUTCDate(start.getUTCDate() - 7);
+    return start.toISOString().slice(0, 10);
+  }, [files, rawRows]);
+
+  useEffect(() => {
+    try { const saved = localStorage.getItem(TRANSFER_MAP_KEY); if (saved) setTransferMap(JSON.parse(saved) as Record<string, string>); } catch { /* Optional. */ }
+  }, []);
+  const updateTransferMap = (number: string, accountId: string) => setTransferMap((current) => {
+    const next = { ...current }; if (accountId === "none") delete next[number]; else next[number] = accountId;
+    try { localStorage.setItem(TRANSFER_MAP_KEY, JSON.stringify(next)); } catch { /* Optional. */ }
+    return next;
+  });
+
+  // Load what is already in YNAB so rows that exist there can be flagged before they are imported.
+  useEffect(() => {
+    if (!sessionToken || !planId || !sinceDate) { setExisting([]); setExistingStatus("idle"); return; }
+    let cancelled = false;
+    setExistingStatus("loading");
+    fetchTransactions(sessionToken, planId, sinceDate)
+      .then((items) => { if (!cancelled) { setExisting(items); setExistingStatus("ready"); } })
+      .catch((error) => { if (!cancelled) { setExisting([]); setExistingStatus("failed"); toast.error(`${error instanceof Error ? error.message : "Could not read existing YNAB transactions."} Duplicates already in YNAB will not be detected.`); } });
+    return () => { cancelled = true; };
+  }, [sessionToken, planId, sinceDate, existingVersion]);
+
+  const accountName = useCallback((id: string) => accounts.find((account) => account.id === id)?.name ?? "another account", [accounts]);
+  const batchPlan = useMemo(() => planBatch(files.map((file) => ({ id: file.id, accountId: file.accountId, rows: (rawRows.get(file.id) ?? []).map(({ rowIndex, date, payee, amount, importId, valid }) => ({ rowIndex, date, payee, amount, importId, valid })) })), existing, transferMap, accountName), [files, rawRows, existing, transferMap, accountName]);
+  const effectiveRows = useMemo(() => new Map(files.map((file) => [file.id, applyPlan(rawRows.get(file.id) ?? [], file, batchPlan.get(file.id))])), [files, rawRows, batchPlan]);
+  const prepared = useMemo(() => (activeFile ? effectiveRows.get(activeFile.id) : undefined) ?? [], [activeFile, effectiveRows]);
+  const skippedCount = prepared.filter((row) => row.valid && row.skipped && !row.selected).length;
+  const transferNumbers = useMemo(() => Array.from(new Set(files.flatMap((file) => (rawRows.get(file.id) ?? []).filter((row) => row.valid).map((row) => transferAccountNumber(row.payee)).filter((value): value is string => Boolean(value))))).sort(), [files, rawRows]);
 
   const selectedValid = prepared.filter((row) => row.selected && row.valid);
   const invalidCount = prepared.filter((row) => !row.valid).length;
@@ -197,17 +261,21 @@ export default function Home() {
   const inflow = selectedValid.filter((row) => row.amount > 0).reduce((sum, row) => sum + row.amount, 0);
   const mappingReady = Boolean(mapping.date && mapping.payee && (mapping.amount || mapping.debit || mapping.credit));
 
-  const batchReady = files.length > 0 && !loadingAccounts && files.every(file => accounts.some(account => account.id === file.accountId) && file.mapping.date && file.mapping.payee && (file.mapping.amount || file.mapping.debit || file.mapping.credit) && prepareFile(file).some(row => row.valid && row.selected));
+  const batchReady = files.length > 0 && !loadingAccounts && files.every(file => accounts.some(account => account.id === file.accountId) && file.mapping.date && file.mapping.payee && (file.mapping.amount || file.mapping.debit || file.mapping.credit)) && existingStatus !== "loading" && files.some(file => (effectiveRows.get(file.id) ?? []).some(row => row.valid && row.selected));
   const sync = async () => {
     if (!batchReady || !sessionToken || !planId || syncing) return;
     setSyncing(true);
     let failed = false;
     for (const file of files) {
       let imported = 0; let duplicates = 0; const transactionIds: string[] = [];
-      const rows = prepareFile(file).filter(row => row.selected && row.valid);
+      const rows = (effectiveRows.get(file.id) ?? []).filter(row => row.selected && row.valid);
+      if (!rows.length) continue;
       try {
         for (let offset = 0; offset < rows.length; offset += 500) {
-          const result = await postTransactions(sessionToken, planId, rows.slice(offset, offset + 500).map(row => ({account_id: file.accountId, date: row.date, amount: row.amount, payee_name: row.payee, memo: row.memo, cleared: "cleared", approved: false, import_id: row.importId})));
+          const result = await postTransactions(sessionToken, planId, rows.slice(offset, offset + 500).map(row => {
+            const transferPayeeId = row.transferAccountId ? accounts.find(account => account.id === row.transferAccountId)?.transfer_payee_id : undefined;
+            return {account_id: file.accountId, date: row.date, amount: row.amount, ...(transferPayeeId ? {payee_id: transferPayeeId} : {payee_name: row.payee}), memo: row.memo, cleared: "cleared", approved: false, import_id: row.importId};
+          }));
           imported += result.transaction_ids.length; duplicates += result.duplicate_import_ids.length; transactionIds.push(...result.transaction_ids);
         }
         setFiles(current => current.map(item => item.id === file.id ? {...item, result: {imported, duplicates, transactionIds}, error: undefined} : item));
@@ -217,6 +285,10 @@ export default function Home() {
       }
     }
     setSyncing(false);
+    setExistingVersion(version => version + 1);
+    setRefreshingAccounts(true);
+    try { setAccounts((await fetchAccounts(sessionToken, planId)).filter(account => !account.closed && !account.deleted)); } catch { /* The balance check is optional. */ }
+    setRefreshingAccounts(false);
     if (failed) toast.error("Some files could not finish. Review the results and retry.");
     else toast.success("Batch sync complete");
   };
@@ -250,9 +322,18 @@ export default function Home() {
     return () => lifecycle.abort();
   }, [accountId, fileName, invalidCount, mappingReady, prepared.length, selectedValid.length]);
 
-  const allSelected = prepared.length > 0 && prepared.every((row) => selectedRows.has(row.rowIndex));
-  const toggleAll = (checked: boolean) => setSelectedRows(checked ? new Set(prepared.map((row) => row.rowIndex)) : new Set());
-  const toggleRow = (rowIndex: number, checked: boolean) => setSelectedRows((current) => { const next = new Set(current); if (checked) next.add(rowIndex); else next.delete(rowIndex); return next; });
+  const allSelected = prepared.length > 0 && prepared.every((row) => row.selected);
+  const setForcedRows = (value: Set<number> | ((current: Set<number>) => Set<number>)) => updateActive("forcedRows", value);
+  const toggleAll = (checked: boolean) => {
+    setSelectedRows(checked ? new Set(prepared.map((row) => row.rowIndex)) : new Set());
+    setForcedRows(checked ? new Set(prepared.filter((row) => row.skipped).map((row) => row.rowIndex)) : new Set());
+  };
+  const toggleRow = (rowIndex: number, checked: boolean) => {
+    const toggled = (current: Set<number>) => { const next = new Set(current); if (checked) next.add(rowIndex); else next.delete(rowIndex); return next; };
+    // Flagged rows (duplicates, payments covered by a transfer) stay in the selection; "forced" records that the user chose to import one anyway.
+    if (prepared.find((row) => row.rowIndex === rowIndex)?.skipped) { setForcedRows(toggled); if (checked) setSelectedRows(toggled); }
+    else setSelectedRows(toggled);
+  };
 
   return (
     <main className="min-h-screen bg-background text-foreground">
@@ -303,12 +384,15 @@ export default function Home() {
             <h2 className="text-lg font-semibold">Files to sync ({files.length})</h2>
             <p className="text-sm text-muted-foreground">Assign each file to an account in this plan. Select Review to adjust its mapping and transactions.</p>
             {files.map(file => <div key={file.id} className={`rounded-xl border p-4 grid gap-3 sm:grid-cols-[minmax(0,1fr)_minmax(180px,1fr)_auto] ${file.id === activeFile?.id ? "border-primary bg-muted/40" : ""}`}>
-              <div className="min-w-0"><p className="font-semibold break-all">{file.fileName}</p><p className="text-sm text-muted-foreground">{prepareFile(file).filter(row => row.valid && row.selected).length} selected · {file.csv.rows.length} rows</p>{file.result && <p className="text-sm">{file.result.imported} imported · {file.result.duplicates} duplicates skipped</p>}{file.error && <p className="text-sm text-destructive" role="alert">{file.error}</p>}</div>
+              <div className="min-w-0"><p className="font-semibold break-all">{file.fileName}</p><p className="text-sm text-muted-foreground">{(effectiveRows.get(file.id) ?? []).filter(row => row.valid && row.selected).length} selected · {file.csv.rows.length} rows{(effectiveRows.get(file.id) ?? []).some(row => row.valid && row.skipped && !row.selected) ? ` · ${(effectiveRows.get(file.id) ?? []).filter(row => row.valid && row.skipped && !row.selected).length} skipped` : ""}</p>{file.result && <p className="text-sm">{file.result.imported} imported · {file.result.duplicates} duplicates skipped</p>}{file.error && <p className="text-sm text-destructive" role="alert">{file.error}</p>}<PendingNote rows={effectiveRows.get(file.id) ?? []} />{file.result && <BalanceCheck bank={bankBalance(file)} account={accounts.find(account => account.id === file.accountId)} refreshing={refreshingAccounts} />}</div>
               <SelectField label="Destination account" value={file.accountId} onChange={value => setFiles(current => current.map(item => item.id === file.id ? {...item, accountId: value, result: null, error: undefined} : item))} disabled={!planId || loadingAccounts || syncing} placeholder="Assign an account" items={accounts} />
               <div className="flex gap-2 items-center">{file.result && file.result.transactionIds.length > 0 && <Button variant="outline" onClick={() => undoSync(file)} disabled={undoingId === file.id}>{undoingId === file.id ? <Loader2 className="animate-spin" /> : <RotateCcw />}{undoingId === file.id ? "Undoing…" : "Undo"}</Button>}<Button variant="outline" onClick={() => setActiveId(file.id)}>Review</Button><Button variant="ghost" aria-label={`Remove ${file.fileName}`} onClick={() => setFiles(current => current.filter(item => item.id !== file.id))}><X /></Button></div>
             </div>)}
+            {transferNumbers.length > 0 && <div className="space-y-3 rounded-xl border p-4"><div><p className="font-semibold">Account-to-account transfers</p><p className="text-sm text-muted-foreground">Match each CIBC account number to its YNAB account so these rows import as real transfers instead of uncategorized payees. Your choices are remembered on this browser.</p></div><div className="grid gap-3 sm:grid-cols-2">{transferNumbers.map(number => <SelectField key={number} label={`Acct ${number}`} value={transferMap[number] ?? "none"} onChange={value => updateTransferMap(number, value)} disabled={!connected || loadingAccounts || syncing} placeholder="Regular payee" items={[{id: "none", name: "Regular payee (not a transfer)"}, ...accounts]} />)}</div></div>}
+            {existingStatus === "loading" && <p className="flex items-center gap-2 text-sm text-muted-foreground"><Loader2 className="h-4 w-4 animate-spin" /> Checking YNAB for transactions that already exist…</p>}
+            {existingStatus === "failed" && <p className="text-sm text-destructive" role="alert">Could not check YNAB for existing transactions, so duplicates already in YNAB are not flagged.</p>}
             <Button onClick={sync} disabled={!batchReady || syncing}>{syncing ? "Syncing files…" : `Sync all ${files.length} files to YNAB`}</Button>
-            {!batchReady && <p className="text-sm text-muted-foreground">Each file needs an account, valid mapping, and at least one valid selected transaction. Remove files you do not want to import.</p>}
+            {!batchReady && <p className="text-sm text-muted-foreground">Every file needs an account and a valid mapping, and at least one file needs a transaction to import. Files with nothing selected are skipped.</p>}
           </div>}
           {csv && <>
             <div className="panel p-5 sm:p-6">
@@ -327,9 +411,9 @@ export default function Home() {
             </div>
 
             <div className="panel overflow-hidden">
-              <div className="flex flex-col gap-4 border-b border-border p-5 sm:flex-row sm:items-center sm:justify-between sm:p-6"><div><h2 className="text-lg font-semibold">Review transactions</h2><p className="text-sm text-muted-foreground">Uncheck anything you don’t want to send.</p></div><div className="grid grid-cols-3 gap-2 text-center"><Stat label="Selected" value={String(selectedValid.length)} /><Stat label="Outflow" value={formatCurrency(Math.abs(outflow))} /><Stat label="Inflow" value={formatCurrency(inflow)} /></div></div>
+              <div className="flex flex-col gap-4 border-b border-border p-5 sm:flex-row sm:items-center sm:justify-between sm:p-6"><div><h2 className="text-lg font-semibold">Review transactions</h2><p className="text-sm text-muted-foreground">Uncheck anything you don’t want to send.{skippedCount > 0 ? ` ${skippedCount} row${skippedCount === 1 ? " was" : "s were"} skipped automatically (already in YNAB, or a card payment imported once as a transfer). Tick a row to import it anyway.` : ""}</p></div><div className="grid grid-cols-3 gap-2 text-center"><Stat label="Selected" value={String(selectedValid.length)} /><Stat label="Outflow" value={formatCurrency(Math.abs(outflow))} /><Stat label="Inflow" value={formatCurrency(inflow)} /></div></div>
               {invalidCount > 0 && <Alert variant="destructive" className="m-5 mb-0 sm:mx-6"><X /><AlertTitle>{invalidCount} row{invalidCount === 1 ? "" : "s"} need attention</AlertTitle><AlertDescription>Check the date format and amount mapping. Pending transactions are excluded until posted. Invalid rows will not be synced.</AlertDescription></Alert>}
-              <div className="max-h-[520px] overflow-auto"><Table><TableHeader className="sticky top-0 z-10 bg-card"><TableRow><TableHead className="w-12"><Checkbox checked={allSelected} onCheckedChange={(value) => toggleAll(Boolean(value))} aria-label="Select all transactions" /></TableHead><TableHead>Date</TableHead><TableHead>Payee</TableHead><TableHead>Status</TableHead><TableHead className="text-right">Amount</TableHead></TableRow></TableHeader><TableBody>{prepared.map((row) => <TableRow key={row.rowIndex} className={!row.valid ? "bg-destructive/5" : ""}><TableCell><Checkbox checked={row.selected} onCheckedChange={(value) => toggleRow(row.rowIndex, Boolean(value))} aria-label={`Select row ${row.rowIndex + 1}`} /></TableCell><TableCell className="whitespace-nowrap font-medium">{row.date}</TableCell><TableCell><div className="max-w-[360px] truncate">{row.payee}</div>{row.memo && <div className="max-w-[360px] truncate text-xs text-muted-foreground">{row.memo}</div>}</TableCell><TableCell>{row.valid ? <Badge variant="outline" className="border-[#b8d8cc] text-[#087a55]">Ready</Badge> : <span className="text-sm font-medium text-destructive">{row.error}</span>}</TableCell><TableCell className={`whitespace-nowrap text-right font-semibold tabular-nums ${row.amount > 0 ? "text-[#087a55]" : ""}`}>{formatCurrency(row.amount)}</TableCell></TableRow>)}</TableBody></Table></div>
+              <div className="max-h-[520px] overflow-auto"><Table><TableHeader className="sticky top-0 z-10 bg-card"><TableRow><TableHead className="w-12"><Checkbox checked={allSelected} onCheckedChange={(value) => toggleAll(Boolean(value))} aria-label="Select all transactions" /></TableHead><TableHead>Date</TableHead><TableHead>Payee</TableHead><TableHead>Status</TableHead><TableHead className="text-right">Amount</TableHead></TableRow></TableHeader><TableBody>{prepared.map((row) => <TableRow key={row.rowIndex} className={!row.valid ? "bg-destructive/5" : ""}><TableCell><Checkbox checked={row.selected} onCheckedChange={(value) => toggleRow(row.rowIndex, Boolean(value))} aria-label={`Select row ${row.rowIndex + 1}`} /></TableCell><TableCell className="whitespace-nowrap font-medium">{row.date}</TableCell><TableCell><div className="max-w-[360px] truncate">{row.payee}</div>{row.memo && <div className="max-w-[360px] truncate text-xs text-muted-foreground">{row.memo}</div>}</TableCell><TableCell>{row.valid ? <div className="space-y-1"><Badge variant="outline" className={row.skipped && !row.selected ? "border-[#e6cf9a] text-[#9a6700]" : "border-[#b8d8cc] text-[#087a55]"}>{row.skipped && !row.selected ? "Skipped" : "Ready"}</Badge>{row.note && <div className={`max-w-[320px] text-xs ${row.tone === "warn" ? "text-[#9a6700]" : "text-muted-foreground"}`}>{row.note}</div>}</div> : <span className="text-sm font-medium text-destructive">{row.error}</span>}</TableCell><TableCell className={`whitespace-nowrap text-right font-semibold tabular-nums ${row.amount > 0 ? "text-[#087a55]" : ""}`}>{formatCurrency(row.amount)}</TableCell></TableRow>)}</TableBody></Table></div>
               <div className="border-t border-border bg-[#fafcfd] p-5 sm:p-6">
                 {syncResult && <div className="mb-4 flex flex-col gap-3 rounded-xl border border-[#b8d8cc] bg-[#edf9f4] p-4 text-[#164e3d] sm:flex-row sm:items-start sm:justify-between"><div className="flex items-start gap-3"><CheckCircle2 className="mt-0.5 h-5 w-5 shrink-0" /><div><p className="font-semibold">Sync complete</p><p className="text-sm text-[#35695a]">{syncResult.imported} added to YNAB{syncResult.duplicates ? ` · ${syncResult.duplicates} duplicate${syncResult.duplicates === 1 ? "" : "s"} safely skipped` : ""}.</p>{syncResult.transactionIds.length > 0 && <p className="text-xs text-[#35695a]">You can undo this until you leave or reload the page.</p>}</div></div>{syncResult.transactionIds.length > 0 && activeFile && <Button variant="outline" size="sm" className="shrink-0" onClick={() => undoSync(activeFile)} disabled={undoingId === activeFile.id}>{undoingId === activeFile.id ? <Loader2 className="animate-spin" /> : <RotateCcw />}{undoingId === activeFile.id ? "Undoing…" : "Undo sync"}</Button>}</div>}
                 <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between"><div className="flex items-center gap-2 text-sm text-muted-foreground"><ShieldCheck className="h-4 w-4 text-[#087a55]" /> Duplicate-safe import IDs are added automatically</div><Button size="lg" className="h-12 min-w-56" onClick={sync} disabled={syncing || !batchReady}>{syncing ? <Loader2 className="animate-spin" /> : <ArrowRight />}{syncing ? "Syncing…" : `Sync all ${files.length} files to YNAB`}</Button></div>
@@ -342,6 +426,23 @@ export default function Home() {
       </fieldset>
     </main>
   );
+}
+
+function PendingNote({ rows }: { rows: Prepared[] }) {
+  const pending = rows.filter((row) => row.pending);
+  if (!pending.length) return null;
+  const total = Math.abs(pending.reduce((sum, row) => sum + row.amount, 0));
+  return <p className="mt-1 text-xs text-muted-foreground">{pending.length} pending transaction{pending.length === 1 ? "" : "s"} ({formatCurrency(total)}) not imported yet. YNAB will not include them until they post.</p>;
+}
+
+function BalanceCheck({ bank, account, refreshing }: { bank: number | null; account?: Account; refreshing: boolean }) {
+  if (bank === null) return null;
+  if (refreshing) return <p className="mt-1 flex items-center gap-1.5 text-xs text-muted-foreground"><Loader2 className="h-3 w-3 animate-spin" /> Checking YNAB balance…</p>;
+  if (account?.cleared_balance === undefined) return null;
+  const difference = account.cleared_balance - bank;
+  if (Math.abs(difference) < 5) return <p className="mt-1 text-xs font-medium text-[#087a55]">Balance check passed: YNAB’s cleared balance matches the bank ({formatCurrency(bank)}).</p>;
+  const uncleared = (account.balance ?? account.cleared_balance) - account.cleared_balance;
+  return <div className="mt-1 space-y-0.5 text-xs text-[#9a6700]" role="alert"><p className="font-medium">Balance check: YNAB cleared {formatCurrency(account.cleared_balance)} vs bank {formatCurrency(bank)} (off by {formatCurrency(difference)}).</p><p>{uncleared !== 0 ? `YNAB also has ${formatCurrency(uncleared)} uncleared, which the bank file does not include — look for duplicates or manual entries. ` : ""}Otherwise look for missing rows, or history from before this file that is not in YNAB.</p></div>;
 }
 
 function StepDot({ step, complete, active }: { step: string; complete: boolean; active: boolean }) {
