@@ -13,6 +13,7 @@ CIBC Caribbean doesn't offer a direct bank-feed integration with YNAB, so budget
 - **Prevents duplicate transactions.** Deterministic, duplicate-safe import IDs mean re-uploading a file or overlapping date ranges never double-imports a transaction.
 - **Imports card payments once, as real transfers.** When you load a chequing file together with its card files, each "CIBC FCIB Credit Card" payment is matched to the card's "PAYMENT RECEIVED" row and imported a single time as a YNAB transfer to the correct card. "Transfer To/From Acct …" rows can be mapped to a YNAB account the same way.
 - **Checks what is already in YNAB.** Before syncing, rows that match an existing transaction (same account and amount within a few days, or the same import ID) are flagged and unticked so manual or bank-linked entries are not duplicated. Tick a row to import it anyway.
+- **Verifies the result.** After a sync, the chequing file's running balance is compared with YNAB's cleared balance, with a warning (including any uncleared amount) if they differ. Pending card transactions are listed so you know what YNAB is still missing.
 - **Undo any sync.** If something looks wrong in YNAB afterward, one click removes exactly the transactions that sync just created.
 - **Runs entirely in your browser.** CSV parsing happens locally, and your YNAB personal access token is used to call YNAB's API directly from your browser — nothing about your data or your token ever passes through a server of ours. There isn't one; see [Architecture](#architecture) below.
 

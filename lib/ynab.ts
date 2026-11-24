@@ -1,7 +1,7 @@
 const YNAB_API = "https://api.ynab.com/v1";
 
 export type Plan = { id: string; name: string };
-export type Account = { id: string; name: string; closed?: boolean; deleted?: boolean; transfer_payee_id?: string | null };
+export type Account = { id: string; name: string; closed?: boolean; deleted?: boolean; transfer_payee_id?: string | null; balance?: number; cleared_balance?: number };
 export type ExistingTransaction = { id: string; account_id: string; date: string; amount: number; payee_name?: string | null; import_id?: string | null; deleted?: boolean };
 
 type YnabData = {

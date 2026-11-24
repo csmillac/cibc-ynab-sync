@@ -22,7 +22,7 @@ type Mapping = { date: string; payee: string; amount: string; debit: string; cre
 type AmountMode = "signed" | "expenses-positive";
 type SyncResult = { imported: number; duplicates: number; transactionIds: string[] };
 type ImportFile = { id: string; csv: CsvData; fileName: string; accountId: string; mapping: Mapping; dateFormat: DateFormat; amountMode: AmountMode; selectedRows: Set<number>; forcedRows: Set<number>; result: SyncResult | null; error?: string };
-type Prepared = { rowIndex: number; date: string; payee: string; memo: string; amount: number; importId: string; selected: boolean; valid: boolean; error?: string; skipped: boolean; note?: string; tone?: "info" | "warn"; transferAccountId?: string };
+type Prepared = { rowIndex: number; date: string; payee: string; memo: string; amount: number; importId: string; selected: boolean; valid: boolean; error?: string; skipped: boolean; pending: boolean; note?: string; tone?: "info" | "warn"; transferAccountId?: string };
 
 const EMPTY_MAPPING: Mapping = { date: "", payee: "", amount: "", debit: "", credit: "", memo: "" };
 const normalize = (value: string) => value.toLowerCase().replace(/[^a-z0-9]/g, "");
@@ -65,6 +65,20 @@ function applyPlan(rows: Prepared[], file: ImportFile, filePlan: Map<number, Row
   });
 }
 
+// The bank's running balance after the most recent transaction in the file (BBD milliunits), or null if the file has none.
+function bankBalance(file: ImportFile): number | null {
+  const header = file.csv.headers.find((name) => normalize(name) === "runningbalance");
+  if (!header || !file.mapping.date) return null;
+  const entries = file.csv.rows.map((row, index) => ({ index, date: parseDate(row[file.mapping.date] ?? "", file.dateFormat) ?? "", balance: parseMoney(row[header] ?? "") })).filter((entry): entry is { index: number; date: string; balance: number } => entry.balance !== null);
+  if (!entries.length) return null;
+  const latest = entries.reduce((best, entry) => (entry.date > best ? entry.date : best), entries[0].date);
+  const sameDay = entries.filter((entry) => entry.date === latest);
+  // Exports list newest first; when the file runs oldest first, the last row of the latest day is the closing balance.
+  const descending = entries[0].date >= entries[entries.length - 1].date;
+  const closing = descending ? sameDay[0] : sameDay[sameDay.length - 1];
+  return Math.round(closing.balance * 1000);
+}
+
 function prepareFile({csv, mapping, dateFormat, amountMode, selectedRows}: ImportFile): Prepared[] {
     if (!csv) return [];
     const occurrences = new Map<string, number>();
@@ -88,7 +102,7 @@ function prepareFile({csv, mapping, dateFormat, amountMode, selectedRows}: Impor
       const occurrence = (occurrences.get(occurrenceKey) ?? 0) + 1;
       if (!pending) occurrences.set(occurrenceKey, occurrence);
       const errors = [pending ? "Pending — excluded" : "", !date && !pending ? "Invalid date" : "", amountValue === null || amount === 0 ? "Invalid amount" : ""].filter(Boolean);
-      return { rowIndex, date: date ?? "—", payee, memo, amount, importId: date ? `YNAB:${amount}:${date}:${occurrence}` : "", selected: selectedRows.has(rowIndex), valid: errors.length === 0, error: errors.join(" · ") || undefined, skipped: false };
+      return { rowIndex, date: date ?? "—", payee, memo, amount, importId: date ? `YNAB:${amount}:${date}:${occurrence}` : "", selected: selectedRows.has(rowIndex), valid: errors.length === 0, error: errors.join(" · ") || undefined, skipped: false, pending };
     });
 }
 
@@ -111,6 +125,7 @@ export default function Home() {
   const [existingStatus, setExistingStatus] = useState<"idle" | "loading" | "ready" | "failed">("idle");
   const [existingVersion, setExistingVersion] = useState(0);
   const [transferMap, setTransferMap] = useState<Record<string, string>>({});
+  const [refreshingAccounts, setRefreshingAccounts] = useState(false);
   const [syncing, setSyncing] = useState(false);
   const [undoingId, setUndoingId] = useState<string | null>(null);
   const activeFile = files.find(file => file.id === activeId) ?? files[0];
@@ -271,6 +286,9 @@ export default function Home() {
     }
     setSyncing(false);
     setExistingVersion(version => version + 1);
+    setRefreshingAccounts(true);
+    try { setAccounts((await fetchAccounts(sessionToken, planId)).filter(account => !account.closed && !account.deleted)); } catch { /* The balance check is optional. */ }
+    setRefreshingAccounts(false);
     if (failed) toast.error("Some files could not finish. Review the results and retry.");
     else toast.success("Batch sync complete");
   };
@@ -366,7 +384,7 @@ export default function Home() {
             <h2 className="text-lg font-semibold">Files to sync ({files.length})</h2>
             <p className="text-sm text-muted-foreground">Assign each file to an account in this plan. Select Review to adjust its mapping and transactions.</p>
             {files.map(file => <div key={file.id} className={`rounded-xl border p-4 grid gap-3 sm:grid-cols-[minmax(0,1fr)_minmax(180px,1fr)_auto] ${file.id === activeFile?.id ? "border-primary bg-muted/40" : ""}`}>
-              <div className="min-w-0"><p className="font-semibold break-all">{file.fileName}</p><p className="text-sm text-muted-foreground">{(effectiveRows.get(file.id) ?? []).filter(row => row.valid && row.selected).length} selected · {file.csv.rows.length} rows{(effectiveRows.get(file.id) ?? []).some(row => row.valid && row.skipped && !row.selected) ? ` · ${(effectiveRows.get(file.id) ?? []).filter(row => row.valid && row.skipped && !row.selected).length} skipped` : ""}</p>{file.result && <p className="text-sm">{file.result.imported} imported · {file.result.duplicates} duplicates skipped</p>}{file.error && <p className="text-sm text-destructive" role="alert">{file.error}</p>}</div>
+              <div className="min-w-0"><p className="font-semibold break-all">{file.fileName}</p><p className="text-sm text-muted-foreground">{(effectiveRows.get(file.id) ?? []).filter(row => row.valid && row.selected).length} selected · {file.csv.rows.length} rows{(effectiveRows.get(file.id) ?? []).some(row => row.valid && row.skipped && !row.selected) ? ` · ${(effectiveRows.get(file.id) ?? []).filter(row => row.valid && row.skipped && !row.selected).length} skipped` : ""}</p>{file.result && <p className="text-sm">{file.result.imported} imported · {file.result.duplicates} duplicates skipped</p>}{file.error && <p className="text-sm text-destructive" role="alert">{file.error}</p>}<PendingNote rows={effectiveRows.get(file.id) ?? []} />{file.result && <BalanceCheck bank={bankBalance(file)} account={accounts.find(account => account.id === file.accountId)} refreshing={refreshingAccounts} />}</div>
               <SelectField label="Destination account" value={file.accountId} onChange={value => setFiles(current => current.map(item => item.id === file.id ? {...item, accountId: value, result: null, error: undefined} : item))} disabled={!planId || loadingAccounts || syncing} placeholder="Assign an account" items={accounts} />
               <div className="flex gap-2 items-center">{file.result && file.result.transactionIds.length > 0 && <Button variant="outline" onClick={() => undoSync(file)} disabled={undoingId === file.id}>{undoingId === file.id ? <Loader2 className="animate-spin" /> : <RotateCcw />}{undoingId === file.id ? "Undoing…" : "Undo"}</Button>}<Button variant="outline" onClick={() => setActiveId(file.id)}>Review</Button><Button variant="ghost" aria-label={`Remove ${file.fileName}`} onClick={() => setFiles(current => current.filter(item => item.id !== file.id))}><X /></Button></div>
             </div>)}
@@ -408,6 +426,23 @@ export default function Home() {
       </fieldset>
     </main>
   );
+}
+
+function PendingNote({ rows }: { rows: Prepared[] }) {
+  const pending = rows.filter((row) => row.pending);
+  if (!pending.length) return null;
+  const total = Math.abs(pending.reduce((sum, row) => sum + row.amount, 0));
+  return <p className="mt-1 text-xs text-muted-foreground">{pending.length} pending transaction{pending.length === 1 ? "" : "s"} ({formatCurrency(total)}) not imported yet. YNAB will not include them until they post.</p>;
+}
+
+function BalanceCheck({ bank, account, refreshing }: { bank: number | null; account?: Account; refreshing: boolean }) {
+  if (bank === null) return null;
+  if (refreshing) return <p className="mt-1 flex items-center gap-1.5 text-xs text-muted-foreground"><Loader2 className="h-3 w-3 animate-spin" /> Checking YNAB balance…</p>;
+  if (account?.cleared_balance === undefined) return null;
+  const difference = account.cleared_balance - bank;
+  if (Math.abs(difference) < 5) return <p className="mt-1 text-xs font-medium text-[#087a55]">Balance check passed: YNAB’s cleared balance matches the bank ({formatCurrency(bank)}).</p>;
+  const uncleared = (account.balance ?? account.cleared_balance) - account.cleared_balance;
+  return <div className="mt-1 space-y-0.5 text-xs text-[#9a6700]" role="alert"><p className="font-medium">Balance check: YNAB cleared {formatCurrency(account.cleared_balance)} vs bank {formatCurrency(bank)} (off by {formatCurrency(difference)}).</p><p>{uncleared !== 0 ? `YNAB also has ${formatCurrency(uncleared)} uncleared, which the bank file does not include — look for duplicates or manual entries. ` : ""}Otherwise look for missing rows, or history from before this file that is not in YNAB.</p></div>;
 }
 
 function StepDot({ step, complete, active }: { step: string; complete: boolean; active: boolean }) {
